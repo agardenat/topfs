@@ -1,0 +1,34 @@
+/target
+android/target/
+**/target/
+**/*.rs.bk
+*.pdb
+
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
+
+release.jks
+*.keystore
+*.jks
+*.apk
+*.apk.idsig
+
+# Artefacts de packaging
+/dist
+*.deb
+*.rpm
+*.dmg
+*.AppImage
+CVEfetch-macos.zip
+
+# Bundles macOS hors dist
+*.app/
+
+# Divers OS / editeurs
+Thumbs.db
+*.tmp
+*.bak
+*.orig
