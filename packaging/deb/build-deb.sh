@@ -10,6 +10,7 @@ build_release_binary
 DEB_ARCH="$(dpkg --print-architecture)"
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
+chmod 755 "$STAGE"
 
 install -Dm755 "$BIN_PATH" "$STAGE/usr/bin/$PKG_NAME"
 

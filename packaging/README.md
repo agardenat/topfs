@@ -18,7 +18,11 @@ met à jour la formule Homebrew.
 ```
 
 Sortie : `packaging/dist/topfs_<version>_<arch>.deb`
-Prérequis : `dpkg-deb` (paquet `dpkg`).
+Prérequis : `dpkg-deb` (paquet `dpkg`), cible Rust `x86_64-unknown-linux-musl`
+(ajoutée automatiquement par le script).
+
+Le binaire empaqueté est lié **statiquement** (musl, `static-pie`) : aucune
+dépendance glibc, installable sur n'importe quelle distro x86_64.
 
 ## .rpm
 
@@ -27,8 +31,9 @@ Prérequis : `dpkg-deb` (paquet `dpkg`).
 ```
 
 Sortie : `packaging/dist/topfs-<version>-1.<arch>.rpm`
-Prérequis : `rpmbuild` (`rpm-build` / `rpmdevtools`). Empaquette le binaire
-release préconstruit via `packaging/rpm/topfs.spec`.
+Prérequis : `rpmbuild` (`rpm-build` / `rpmdevtools`), cible
+`x86_64-unknown-linux-musl`. Empaquette le binaire statique musl via
+`packaging/rpm/topfs.spec` (aucune dépendance glibc dans le rpm).
 
 ## Homebrew (Linux et macOS)
 
