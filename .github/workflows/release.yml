@@ -15,10 +15,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install rpmbuild
+      - name: Install rpmbuild + musl toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y rpm
+          sudo apt-get install -y rpm musl-tools
 
       - name: Install Rust + musl target
         run: |
