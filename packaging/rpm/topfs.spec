@@ -3,7 +3,7 @@ Version:        %{_topfs_version}
 Release:        1%{?dist}
 Summary:        Live top-N biggest filesystem entries with tree display
 
-License:        MIT
+License:        Apache-2.0
 URL:            https://github.com/agardenat/topfs
 Source0:        topfs
 

@@ -9,7 +9,7 @@ PKG_VERSION="$(grep -m1 '^version' "$PROJECT_ROOT/Cargo.toml" | sed -E 's/.*"(.*
 PKG_DESC="Live top-N biggest filesystem entries with tree display"
 PKG_MAINTAINER="Antoine Gardenat <agardenat@leisambro.net>"
 PKG_HOMEPAGE="https://github.com/agardenat/topfs"
-PKG_LICENSE="MIT"
+PKG_LICENSE="Apache-2.0"
 
 MUSL_TARGET="x86_64-unknown-linux-musl"
 BIN_PATH="$PROJECT_ROOT/target/$MUSL_TARGET/release/$PKG_NAME"

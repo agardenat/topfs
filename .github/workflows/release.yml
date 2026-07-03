@@ -84,24 +84,22 @@ jobs:
             -e "s/sha256 \"[^\"]*\"/sha256 \"${{ steps.sha.outputs.sha }}\"/" \
             packaging/brew/topfs.rb > topfs.rb.rendered
 
-      - name: Check out the tap repo
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ github.repository_owner }}/homebrew-topfs
-          token: ${{ secrets.TAP_GITHUB_TOKEN }}
-          path: tap
-
-      - name: Commit updated formula
+      - name: Push formula to the tap
+        env:
+          TAP_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
         run: |
-          mkdir -p tap/Formula
-          cp topfs.rb.rendered tap/Formula/topfs.rb
+          owner="${{ github.repository_owner }}"
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/${owner}/homebrew-topfs.git" tap
           cd tap
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          if git diff --quiet; then
+          git checkout -B main
+          mkdir -p Formula
+          cp ../topfs.rb.rendered Formula/topfs.rb
+          git add Formula/topfs.rb
+          if git diff --cached --quiet; then
             echo "formula already up to date"
             exit 0
           fi
-          git add Formula/topfs.rb
           git commit -m "topfs ${GITHUB_REF_NAME}"
-          git push
+          git push -u origin main
