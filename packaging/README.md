@@ -60,3 +60,43 @@ différent — relancer le script ou recalculer si besoin.
 
 Tous les scripts lisent la version depuis `Cargo.toml`. Bumper la version
 là, puis relancer.
+
+## Release GitHub (automatique)
+
+Le workflow [`.github/workflows/release.yml`](../.github/workflows/release.yml)
+se déclenche sur un tag `v*` et :
+
+1. vérifie que le tag correspond à la version de `Cargo.toml` ;
+2. construit le `.deb` et le `.rpm` (musl statique) ;
+3. crée la GitHub Release et y attache les deux paquets ;
+4. calcule le sha256 du tarball de release GitHub, patche la formule
+   (`packaging/brew/topfs.rb` comme gabarit) et pousse `Formula/topfs.rb`
+   dans le dépôt tap `homebrew-topfs`.
+
+Publier une version :
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+### Setup one-time du tap Homebrew
+
+1. Créer un dépôt GitHub **public** nommé `homebrew-topfs` sous le même
+   propriétaire (`agardenat/homebrew-topfs`). Peut rester vide : le workflow
+   crée `Formula/topfs.rb` à la première release.
+2. Générer un PAT (classic `repo`, ou fine-grained avec accès *Contents:
+   write* sur `homebrew-topfs`).
+3. L'ajouter comme secret du dépôt `topfs` sous le nom `TAP_GITHUB_TOKEN`
+   (Settings → Secrets and variables → Actions).
+
+Ensuite, côté utilisateur :
+
+```bash
+brew tap agardenat/topfs
+brew install topfs
+```
+
+Le script local [`brew/update-formula.sh`](brew/update-formula.sh) reste utile
+pour tester la formule hors CI ; en release, le workflow gère l'url + le
+sha256 automatiquement.

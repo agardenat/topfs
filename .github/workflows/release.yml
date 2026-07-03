@@ -1,0 +1,107 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  packages:
+    name: build deb + rpm and publish release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install rpmbuild
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm
+
+      - name: Install Rust + musl target
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add x86_64-unknown-linux-musl
+
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          cargo_version="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [ "$cargo_version" != "$tag_version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $cargo_version" >&2
+            exit 1
+          fi
+
+      - name: Build packages
+        run: |
+          ./packaging/deb/build-deb.sh
+          ./packaging/rpm/build-rpm.sh
+          ls -l packaging/dist
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            packaging/dist/*.deb \
+            packaging/dist/*.rpm
+
+  tap:
+    name: update Homebrew tap
+    needs: packages
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Require tap token
+        run: |
+          if [ -z "${{ secrets.TAP_GITHUB_TOKEN }}" ]; then
+            echo "::error::secret TAP_GITHUB_TOKEN is not set; cannot push to the tap repo" >&2
+            exit 1
+          fi
+
+      - name: Compute sha256 of the release tarball
+        id: sha
+        run: |
+          tag="$GITHUB_REF_NAME"
+          url="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${tag}.tar.gz"
+          for i in 1 2 3 4 5; do
+            if curl -fsSL "$url" -o release.tar.gz; then break; fi
+            echo "tarball not ready yet, retry $i"; sleep 5
+          done
+          sha="$(sha256sum release.tar.gz | cut -d' ' -f1)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Render formula
+        run: |
+          sed -E \
+            -e "s#url \"[^\"]*\"#url \"${{ steps.sha.outputs.url }}\"#" \
+            -e "s/sha256 \"[^\"]*\"/sha256 \"${{ steps.sha.outputs.sha }}\"/" \
+            packaging/brew/topfs.rb > topfs.rb.rendered
+
+      - name: Check out the tap repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/homebrew-topfs
+          token: ${{ secrets.TAP_GITHUB_TOKEN }}
+          path: tap
+
+      - name: Commit updated formula
+        run: |
+          mkdir -p tap/Formula
+          cp topfs.rb.rendered tap/Formula/topfs.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet; then
+            echo "formula already up to date"
+            exit 0
+          fi
+          git add Formula/topfs.rb
+          git commit -m "topfs ${GITHUB_REF_NAME}"
+          git push
