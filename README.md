@@ -8,14 +8,14 @@ Affichage temps réel des plus gros fichiers et répertoires d'un système de fi
 
 ```
              /data/logs
-  12.4 GiB   ├── app/ (42 2026-07-01 14:22)
+  12.4 GiB   ├── app/ (1 284 files, 2026-07-01 14:22)
    8.1 GiB   │   ├── access.log.2026-06 (2026-06-30 23:59)
    4.2 GiB   │   └── error.log (2026-07-01 14:22)
-   3.9 GiB   └── nginx/ (18 2026-07-01 09:10)
+   3.9 GiB   └── nginx/ (312 files, 2026-07-01 09:10)
   done  1284 entries  total:  16.3 GiB
 ```
 
-Les tailles sont colorées par ordre de grandeur (cyan < vert < jaune < magenta < rouge). Les répertoires du top-N affichent entre parenthèses leur nombre d'enfants directs et leur date de dernière modification.
+Les tailles sont colorées par ordre de grandeur (cyan < vert < jaune < magenta < rouge). Les répertoires du top-N affichent entre parenthèses le nombre de fichiers qu'ils contiennent — **récursivement**, comme la taille — et leur date de dernière modification. Le compte apparaît dès le scan et se met à jour en continu.
 
 ## Installation
 
@@ -113,7 +113,7 @@ topfs --newer-than 2w --older-than 2d /var/log
 
 Une fenêtre vide (`since >= until`) est rejetée. Le filtre actif est rappelé dans la ligne de statut et dans la sortie Slack.
 
-Seuls les fichiers sont filtrés : les répertoires restent affichés, avec la taille cumulée des seuls fichiers retenus.
+Seuls les fichiers sont filtrés : les répertoires restent affichés, avec la taille **et le nombre de fichiers** cumulés sur les seuls fichiers retenus. Un répertoire de 10 000 fichiers dont 3 sont récents affiche donc `(3 files, ...)` sous `--since`.
 
 ### Usage disque vs taille apparente
 

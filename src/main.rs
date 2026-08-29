@@ -69,8 +69,8 @@ struct Entry {
     is_dir: bool,
     /// Last modification time as "YYYY-MM-DD HH:MM" string (populated at end for top entries)
     mtime: Option<String>,
-    /// Number of direct children (populated at end for top entries)
-    child_count: Option<u64>,
+    /// Number of files kept under this path, recursively (accumulated during the scan)
+    file_count: u64,
 }
 
 impl Default for Entry {
@@ -79,7 +79,7 @@ impl Default for Entry {
             size: 0,
             is_dir: false,
             mtime: None,
-            child_count: None,
+            file_count: 0,
         }
     }
 }
@@ -90,7 +90,7 @@ type SharedEntryMap = Arc<DashMap<PathBuf, Entry>>;
 struct TreeNode {
     size: u64,
     is_dir: bool,
-    child_count: Option<u64>,
+    file_count: u64,
     mtime: Option<String>,
     in_top: bool,
     sort_key: u64,
@@ -154,7 +154,7 @@ fn insert_path(node: &mut TreeNode, components: &[OsString], info: &Entry) {
     if components.is_empty() {
         node.size = info.size;
         node.is_dir = info.is_dir;
-        node.child_count = info.child_count;
+        node.file_count = info.file_count;
         node.mtime = info.mtime.clone();
         node.in_top = true;
         return;
@@ -175,12 +175,44 @@ fn compute_sort_keys(node: &mut TreeNode) -> u64 {
     node.sort_key
 }
 
+/// " (1 234 files, 2026-07-01 14:22)" — file count for directories, mtime when known.
+fn meta_suffix(node: &TreeNode) -> String {
+    let mut parts = Vec::new();
+    if node.is_dir {
+        parts.push(format!(
+            "{} file{}",
+            group_digits(node.file_count),
+            if node.file_count == 1 { "" } else { "s" }
+        ));
+    }
+    if let Some(ref mtime) = node.mtime {
+        parts.push(mtime.clone());
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(", "))
+    }
+}
+
+/// Thin-space digit grouping: 1234567 -> "1 234 567".
+fn group_digits(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push('\u{202f}');
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn render_node(
     node: &TreeNode,
     name: &str,
     prefix: &str,
     is_last: bool,
-    finished: bool,
     out: &mut Vec<String>,
 ) {
     let mut display_name = name.to_string();
@@ -199,21 +231,8 @@ fn render_node(
         format!("{:>10}", "")
     };
 
-    let meta_part = if finished && current.in_top {
-        let mut parts = Vec::new();
-        if let Some(count) = current.child_count {
-            if current.is_dir {
-                parts.push(format!("{}", count));
-            }
-        }
-        if let Some(ref mtime) = current.mtime {
-            parts.push(mtime.clone());
-        }
-        if parts.is_empty() {
-            String::new()
-        } else {
-            ansi(&format!(" ({})", parts.join(" ")), Color::DarkGrey, false)
-        }
+    let meta_part = if current.in_top {
+        ansi(&meta_suffix(current), Color::DarkGrey, false)
     } else {
         String::new()
     };
@@ -241,7 +260,7 @@ fn render_node(
     let n = entries.len();
     for (i, (cname, child)) in entries.iter().enumerate() {
         let last = i == n - 1;
-        render_node(child, &cname.to_string_lossy(), &new_prefix, last, finished, out);
+        render_node(child, &cname.to_string_lossy(), &new_prefix, last, out);
     }
 }
 
@@ -311,7 +330,7 @@ fn walker_local(
                     }
                 }
 
-                if !is_dir && size > 0 {
+                if !is_dir {
                     let mut cur = path.parent();
                     while let Some(p) = cur {
                         if p != root_cb.as_path() && !p.starts_with(&root_cb) {
@@ -320,6 +339,7 @@ fn walker_local(
                         {
                             let mut e = entries_cb.entry(p.to_path_buf()).or_default();
                             e.size += size;
+                            e.file_count += 1;
                             e.is_dir = true;
                         }
                         if p == root_cb.as_path() {
@@ -416,8 +436,8 @@ fn walker_hdfs_cli(
             e.mtime = Some(mtime_str);
         }
 
-        // Accumulate size to parents
-        if !is_dir && size > 0 {
+        // Accumulate size and file count to parents
+        if !is_dir {
             let mut cur = entry_path.parent();
             while let Some(p) = cur {
                 if p != root.as_path() && !p.starts_with(&root) {
@@ -425,6 +445,7 @@ fn walker_hdfs_cli(
                 }
                 let mut e = entries.entry(p.to_path_buf()).or_default();
                 e.size += size;
+                e.file_count += 1;
                 e.is_dir = true;
                 if p == root.as_path() {
                     break;
@@ -496,7 +517,7 @@ fn prune_to_top_n(entries: &SharedEntryMap, root: &Path, count: usize) {
 }
 
 
-/// After scan completes, enrich the top-N entries with child_count and mtime.
+/// After scan completes, enrich the top-N entries with their mtime.
 /// For local paths: stat each directory to get mtime, count immediate children.
 /// For remote paths: child_count is computed from the entries map, mtime already stored.
 fn enrich_top_entries(entries: &SharedEntryMap, root: &Path, count: usize, is_remote: bool) {
@@ -506,25 +527,11 @@ fn enrich_top_entries(entries: &SharedEntryMap, root: &Path, count: usize, is_re
         .filter(|r| r.key().as_path() != root)
         .map(|r| (r.key().clone(), r.value().size, r.value().is_dir))
         .collect();
+
     snapshot.sort_unstable_by(|a, b| b.1.cmp(&a.1));
     snapshot.truncate(count);
 
-    for (path, _, is_dir) in &snapshot {
-        if *is_dir {
-            // Count direct children from the entries map
-            let prefix = path.clone();
-            let child_count = entries
-                .iter()
-                .filter(|r| {
-                    let k = r.key();
-                    k.as_path() != prefix.as_path() && k.parent() == Some(prefix.as_path())
-                })
-                .count() as u64;
-            if let Some(mut e) = entries.get_mut(path) {
-                e.child_count = Some(child_count);
-            }
-        }
-
+    for (path, _, _is_dir) in &snapshot {
         // For local paths, get mtime from filesystem
         if !is_remote {
             if let Ok(meta) = std::fs::metadata(path) {
@@ -804,7 +811,7 @@ fn render_screen(
     let n = top_entries.len();
     for (i, (cname, child)) in top_entries.iter().enumerate() {
         let last = i == n - 1;
-        render_node(child, &cname.to_string_lossy(), "", last, finished, &mut lines);
+        render_node(child, &cname.to_string_lossy(), "", last, &mut lines);
     }
 
     lines.push(status_line);
@@ -885,20 +892,7 @@ fn render_node_plain(
     };
 
     let meta_part = if current.in_top {
-        let mut parts = Vec::new();
-        if let Some(count) = current.child_count {
-            if current.is_dir {
-                parts.push(format!("{}", count));
-            }
-        }
-        if let Some(ref mtime) = current.mtime {
-            parts.push(mtime.clone());
-        }
-        if parts.is_empty() {
-            String::new()
-        } else {
-            format!(" ({})", parts.join(" "))
-        }
+        meta_suffix(current)
     } else {
         String::new()
     };
