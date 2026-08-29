@@ -69,6 +69,10 @@ topfs                          # scan du répertoire courant, top 20
 topfs -n 40 /var               # top 40 sous /var
 topfs -a ~/Downloads           # taille apparente (au lieu de l'usage disque)
 topfs -d 7 /data               # seulement les fichiers modifiés dans les 7 derniers jours
+topfs --since 2026-01-01 /data # fichiers modifiés depuis le 1er janvier 2026
+topfs --until 2025-01-01 /data # fichiers plus vieux que le 1er janvier 2025
+topfs --since 2025-01-01 --until 2025-07-01 /data   # fenêtre entre deux dates
+topfs --older-than 90d /data   # fichiers dont la dernière modification remonte à plus de 90 jours
 topfs hdfs:///user/data        # scan HDFS via le client hdfs
 topfs abfs://container@account/path   # scan Azure Blob Storage
 ```
@@ -83,11 +87,33 @@ Le scan est incrémental et l'affichage se rafraîchit en continu. `Ctrl-C` inte
 | `--count` | `-n` | `20` | Nombre d'entrées à afficher dans le top. |
 | `--refresh-ms` | `-r` | `100` | Intervalle de rafraîchissement de l'affichage, en millisecondes. |
 | `--apparent-size` | `-a` | `false` | Utilise la taille apparente (`len`) au lieu de l'usage disque réel (`blocks × 512`). |
-| `--days` | `-d` | | Ne compte que les fichiers modifiés dans les N derniers jours ; les plus anciens sont exclus de l'accumulation. |
+| `--days` | `-d` | | Ne compte que les fichiers modifiés dans les N derniers jours ; les plus anciens sont exclus de l'accumulation. Incompatible avec `--since`. |
+| `--since` | `-S`, `--newer-than` | | Ne compte que les fichiers modifiés **à partir de** cet instant (borne incluse). |
+| `--until` | `-U`, `--older-than` | | Ne compte que les fichiers modifiés **strictement avant** cet instant. |
 | `--slack` | | | Envoie le résultat à une URL de webhook Slack (désactive l'affichage temps réel). Sans valeur, écrit un format compatible Slack sur stdout. |
 | `--message` | `-m` | | Message d'en-tête à inclure dans la sortie Slack. |
 | `--help` | `-h` | | Affiche l'aide. |
 | `--version` | `-V` | | Affiche la version. |
+
+### Filtres temporels
+
+`--since` et `--until` acceptent deux formes de valeur :
+
+| Forme | Exemples | Sens |
+|-------|----------|------|
+| Date absolue | `2026-01-01`, `"2026-01-01 08:30"`, `2026-01-01T08:30:00` | Instant précis, interprété en **UTC** (comme les dates affichées par `topfs`). Sans heure, minuit. |
+| Âge relatif | `30m`, `12h`, `7d`, `2w` | `maintenant - durée` (`s`, `m`, `h`, `d`, `w`). |
+
+Les deux options se combinent pour délimiter une fenêtre semi-ouverte `[since, until[` :
+
+```bash
+topfs --since 2025-01-01 --until 2025-07-01 /data
+topfs --newer-than 2w --older-than 2d /var/log
+```
+
+Une fenêtre vide (`since >= until`) est rejetée. Le filtre actif est rappelé dans la ligne de statut et dans la sortie Slack.
+
+Seuls les fichiers sont filtrés : les répertoires restent affichés, avec la taille cumulée des seuls fichiers retenus.
 
 ### Usage disque vs taille apparente
 
@@ -97,7 +123,7 @@ Par défaut, `topfs` compte l'usage disque réel (`blocks × 512`, comme `du`), 
 
 Les chemins distants sont détectés par leurs préfixes `hdfs://`, `abfs://`, `abfss://` ou `///`. Le scan délègue à la commande `hdfs dfs -ls -R`, qui doit être présente dans le `PATH` et utilise le client Java Hadoop (compatible Kerberos). Les préfixes sont normalisés vers `hdfs:///...`.
 
-Pour ces chemins, la date de modification provient directement de la sortie `hdfs`, et le filtre `--days` compare les dates au format `YYYY-MM-DD HH:MM`.
+Pour ces chemins, la date de modification provient directement de la sortie `hdfs` au format `YYYY-MM-DD HH:MM` ; les filtres `--days`, `--since` et `--until` s'appliquent de la même façon, en comparant ces dates telles quelles (fuseau du cluster).
 
 ## Sortie Slack
 

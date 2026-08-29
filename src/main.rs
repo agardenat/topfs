@@ -40,8 +40,18 @@ struct Cli {
     apparent_size: bool,
 
     /// Filter to files modified in the last N days (excludes older files from accumulation)
-    #[arg(short = 'd', long = "days")]
-    days: Option<u64>,    
+    #[arg(short = 'd', long = "days", conflicts_with = "since")]
+    days: Option<u64>,
+
+    /// Keep only files modified at or after this instant (dates are UTC).
+    /// Accepts YYYY-MM-DD, "YYYY-MM-DD HH:MM[:SS]" or a relative age (30m, 12h, 7d, 2w)
+    #[arg(short = 'S', long = "since", visible_alias = "newer-than", value_name = "WHEN")]
+    since: Option<String>,
+
+    /// Keep only files modified strictly before this instant (dates are UTC).
+    /// Accepts YYYY-MM-DD, "YYYY-MM-DD HH:MM[:SS]" or a relative age (30m, 12h, 7d, 2w)
+    #[arg(short = 'U', long = "until", visible_alias = "older-than", value_name = "WHEN")]
+    until: Option<String>,
 
     /// Send results to a Slack webhook URL (disables real-time display).
     /// If URL is empty, outputs Slack-compatible format to stdout.
@@ -243,7 +253,7 @@ fn walker_local(
     running: Arc<AtomicBool>,
     scanned: Arc<AtomicU64>,
     apparent: bool,
-    cutoff: Option<std::time::SystemTime>,
+    range: TimeRange,
 ) {
     let entries_cb = Arc::clone(&entries);
     let scanned_cb = Arc::clone(&scanned);
@@ -266,12 +276,10 @@ fn walker_local(
                 let path = child.path();
                 let is_dir = meta.is_dir();
 
-                if !is_dir {
-                    if let Some(c) = cutoff {
-                        match meta.modified() {
-                            Ok(m) if m >= c => {}
-                            _ => continue,
-                        }
+                if !is_dir && range.is_active() {
+                    match mtime_secs(&meta) {
+                        Some(secs) if range.contains(secs) => {}
+                        _ => continue,
                     }
                 }
 
@@ -337,7 +345,7 @@ fn walker_hdfs_cli(
     entries: SharedEntryMap,
     running: Arc<AtomicBool>,
     scanned: Arc<AtomicU64>,
-    cutoff_str: Option<String>,
+    range: TimeRange,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use std::io::BufRead;
     use std::process::{Command, Stdio};
@@ -389,11 +397,10 @@ fn walker_hdfs_cli(
         let path_str = fields[7..].join(" ");
         let entry_path = PathBuf::from(&path_str);
         
-        if !is_dir {
-            if let Some(ref c) = cutoff_str {
-                if mtime_str.as_str() < c.as_str() {
-                    continue;
-                }
+        if !is_dir && range.is_active() {
+            match parse_datetime(&mtime_str) {
+                Ok(secs) if range.contains(secs) => {}
+                _ => continue,
             }
         }
         
@@ -582,6 +589,140 @@ fn days_to_date(days_since_epoch: i64) -> (i64, u32, u32) {
     (y, m, d)
 }
 
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    // Inverse of days_to_date, same source
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u32;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe as i64 - 719468
+}
+
+// ─── Time filtering ─────────────────────────────────────────────────────────
+
+/// Half-open modification-time window `[min, max)`, in seconds since the epoch.
+#[derive(Clone, Copy, Default, Debug)]
+struct TimeRange {
+    min: Option<i64>,
+    max: Option<i64>,
+}
+
+impl TimeRange {
+    fn is_active(&self) -> bool {
+        self.min.is_some() || self.max.is_some()
+    }
+
+    fn contains(&self, secs: i64) -> bool {
+        self.min.map_or(true, |m| secs >= m) && self.max.map_or(true, |m| secs < m)
+    }
+
+    fn label(&self) -> Option<String> {
+        match (self.min, self.max) {
+            (None, None) => None,
+            (Some(a), None) => Some(format!("since {}", format_timestamp(a))),
+            (None, Some(b)) => Some(format!("before {}", format_timestamp(b))),
+            (Some(a), Some(b)) => Some(format!(
+                "{} -> {}",
+                format_timestamp(a),
+                format_timestamp(b)
+            )),
+        }
+    }
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+fn mtime_secs(meta: &std::fs::Metadata) -> Option<i64> {
+    let modified = meta.modified().ok()?;
+    Some(match modified.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        Err(e) => -(e.duration().as_secs() as i64),
+    })
+}
+
+/// Parse `YYYY-MM-DD`, `YYYY-MM-DD HH:MM[:SS]` or `YYYY-MM-DDTHH:MM[:SS]` (UTC).
+fn parse_datetime(s: &str) -> Result<i64, String> {
+    let s = s.trim();
+    let (date_part, time_part) = match s.split_once(|c| c == 'T' || c == ' ') {
+        Some((d, t)) => (d, t.trim()),
+        None => (s, ""),
+    };
+
+    let d: Vec<&str> = date_part.split('-').collect();
+    if d.len() != 3 {
+        return Err(format!("`{}` is not a YYYY-MM-DD date", s));
+    }
+    let year: i64 = d[0]
+        .parse()
+        .map_err(|_| format!("`{}`: bad year", date_part))?;
+    let month: u32 = d[1]
+        .parse()
+        .map_err(|_| format!("`{}`: bad month", date_part))?;
+    let day: u32 = d[2]
+        .parse()
+        .map_err(|_| format!("`{}`: bad day", date_part))?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return Err(format!("`{}`: month/day out of range", date_part));
+    }
+
+    let mut secs = days_from_civil(year, month, day) * 86400;
+
+    if !time_part.is_empty() {
+        let t: Vec<&str> = time_part.split(':').collect();
+        if t.len() < 2 || t.len() > 3 {
+            return Err(format!("`{}`: bad time, expected HH:MM[:SS]", time_part));
+        }
+        let hours: i64 = t[0]
+            .parse()
+            .map_err(|_| format!("`{}`: bad hours", time_part))?;
+        let minutes: i64 = t[1]
+            .parse()
+            .map_err(|_| format!("`{}`: bad minutes", time_part))?;
+        let seconds: i64 = if t.len() == 3 {
+            t[2].parse()
+                .map_err(|_| format!("`{}`: bad seconds", time_part))?
+        } else {
+            0
+        };
+        if !(0..24).contains(&hours) || !(0..60).contains(&minutes) || !(0..61).contains(&seconds) {
+            return Err(format!("`{}`: time out of range", time_part));
+        }
+        secs += hours * 3600 + minutes * 60 + seconds;
+    }
+
+    Ok(secs)
+}
+
+/// Parse a relative age such as `30m`, `12h`, `7d`, `2w` into seconds.
+fn parse_relative(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let (num, unit) = s.split_at(s.len().checked_sub(1)?);
+    let mult = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86400,
+        "w" => 604800,
+        _ => return None,
+    };
+    num.trim().parse::<i64>().ok().map(|n| n * mult)
+}
+
+/// Parse an absolute date or a relative age (interpreted as "N ago").
+fn parse_time_spec(s: &str) -> Result<i64, String> {
+    if let Some(age) = parse_relative(s) {
+        return Ok(now_secs() - age);
+    }
+    parse_datetime(s)
+}
+
 // ─── Rendering ──────────────────────────────────────────────────────────────
 
 struct CursorGuard;
@@ -604,6 +745,7 @@ fn render_screen(
     scanned: u64,
     last_height: &mut u16,
     finished: bool,
+    filter_label: Option<&str>,
 ) {
     let mut snapshot: Vec<(PathBuf, Entry)> = entries
         .iter()
@@ -634,7 +776,7 @@ fn render_screen(
     compute_sort_keys(&mut tree);
 
     let status = if finished { "done " } else { "scan " };
-    let status_line = format!(
+    let mut status_line = format!(
         "{} {} entries  total: {}",
         ansi(
             status,
@@ -644,6 +786,9 @@ fn render_screen(
         scanned,
         ansi(&human_size(root_size), size_color(root_size), true)
     );
+    if let Some(f) = filter_label {
+        status_line.push_str(&format!("  {}", ansi(f, Color::Cyan, false)));
+    }
 
     let mut lines = Vec::new();
 
@@ -790,6 +935,7 @@ fn render_slack_text(
     root: &Path,
     count: usize,
     scanned: u64,
+    filter_label: Option<&str>,
 ) -> String {
     let mut snapshot: Vec<(PathBuf, Entry)> = entries
         .iter()
@@ -819,6 +965,9 @@ fn render_slack_text(
 
     let mut lines = Vec::new();
     lines.push(format!("📂 {}", root.display()));
+    if let Some(f) = filter_label {
+        lines.push(format!("🕒 {}", f));
+    }
 
     let mut top_entries: Vec<_> = tree.children.iter().collect();
     top_entries.sort_by(|a, b| b.1.sort_key.cmp(&a.1.sort_key));
@@ -922,17 +1071,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli.path.clone()
     };
     
-    let cutoff_local: Option<std::time::SystemTime> = cli.days.map(|d| {
-        std::time::SystemTime::now() - Duration::from_secs(d * 86400)
-    });
-
-    let cutoff_str: Option<String> = cli.days.map(|d| {
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-        format_timestamp(now_secs - (d as i64 * 86400))
-    });
+    let mut range = TimeRange::default();
+    if let Some(d) = cli.days {
+        range.min = Some(now_secs() - (d as i64) * 86400);
+    }
+    if let Some(ref spec) = cli.since {
+        range.min = Some(parse_time_spec(spec).map_err(|e| format!("invalid --since: {}", e))?);
+    }
+    if let Some(ref spec) = cli.until {
+        range.max = Some(parse_time_spec(spec).map_err(|e| format!("invalid --until: {}", e))?);
+    }
+    if let (Some(a), Some(b)) = (range.min, range.max) {
+        if a >= b {
+            return Err(format!(
+                "empty time window: --since {} is not before --until {}",
+                format_timestamp(a),
+                format_timestamp(b)
+            )
+            .into());
+        }
+    }
+    let filter_label = range.label();
 
     let entries: SharedEntryMap = Arc::new(DashMap::new());
     let running = Arc::new(AtomicBool::new(true));
@@ -966,14 +1125,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let path = path_str.clone();
         let root_clone = root.clone();
         let apparent = cli.apparent_size;
-        let cutoff_local = cutoff_local;
-        let cutoff_str = cutoff_str.clone();
 
         thread::spawn(move || {
             let result = if is_remote_path(&path) {
-                walker_hdfs_cli(&path, entries, running, scanned, cutoff_str)
+                walker_hdfs_cli(&path, entries, running, scanned, range)
             } else {
-                walker_local(root_clone, entries, running, scanned, apparent, cutoff_local);
+                walker_local(root_clone, entries, running, scanned, apparent, range);
                 Ok(())
             };
             if let Err(e) = result {
@@ -999,6 +1156,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     cur_scanned,
                     &mut last_height,
                     done,
+                    filter_label.as_deref(),
                 );
                 last_scanned = cur_scanned;
             }
@@ -1029,6 +1187,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             scanned.load(Ordering::Relaxed),
             &mut last_height,
             true,
+            filter_label.as_deref(),
         );
         println!();
     }
@@ -1039,6 +1198,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &root,
             cli.count,
             scanned.load(Ordering::Relaxed),
+            filter_label.as_deref(),
         );
 
         if let Some(ref webhook_url) = cli.slack {
