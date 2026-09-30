@@ -12,7 +12,7 @@ use std::ffi::OsString;
 use std::io::{stdout, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -84,7 +84,154 @@ impl Default for Entry {
     }
 }
 
-type SharedEntryMap = Arc<DashMap<PathBuf, Entry>>;
+/// Bounded "N biggest" collection: memory stays O(cap) whatever the input size.
+struct TopN {
+    cap: usize,
+    items: Vec<(PathBuf, Entry)>,
+    min_idx: usize,
+}
+
+impl TopN {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            items: Vec::with_capacity(cap),
+            min_idx: 0,
+        }
+    }
+
+    fn is_full(&self) -> bool {
+        self.items.len() >= self.cap
+    }
+
+    fn accepts(&self, size: u64) -> bool {
+        self.cap > 0 && (!self.is_full() || size > self.items[self.min_idx].1.size)
+    }
+
+    /// `make` is only called when the item actually enters the top, so the path
+    /// is cloned for a handful of candidates rather than for every entry.
+    fn offer(&mut self, size: u64, make: impl FnOnce() -> (PathBuf, Entry)) {
+        if !self.accepts(size) {
+            return;
+        }
+        let item = make();
+        if self.is_full() {
+            self.items[self.min_idx] = item;
+        } else {
+            self.items.push(item);
+        }
+        if self.is_full() {
+            self.min_idx = self
+                .items
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (_, e))| e.size)
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+        }
+    }
+
+    fn into_sorted(mut self) -> Vec<(PathBuf, Entry)> {
+        self.items.sort_unstable_by(|a, b| b.1.size.cmp(&a.1.size));
+        self.items
+    }
+}
+
+/// Thread-safe top-N of files, with a lock-free fast path for the (vast
+/// majority of) files too small to ever make it in.
+struct TopFiles {
+    floor: AtomicU64,
+    top: Mutex<TopN>,
+}
+
+impl TopFiles {
+    fn new(cap: usize) -> Self {
+        Self {
+            floor: AtomicU64::new(0),
+            top: Mutex::new(TopN::new(cap)),
+        }
+    }
+
+    fn offer(&self, size: u64, make: impl FnOnce() -> (PathBuf, Entry)) {
+        if size < self.floor.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut top = self.top.lock().unwrap();
+        top.offer(size, make);
+        if top.is_full() {
+            let min = top.items.get(top.min_idx).map_or(u64::MAX, |(_, e)| e.size);
+            self.floor.store(min.saturating_add(1), Ordering::Relaxed);
+        }
+    }
+
+    fn snapshot(&self) -> Vec<(PathBuf, Entry)> {
+        self.top.lock().unwrap().items.clone()
+    }
+}
+
+/// Scan state: every directory with its aggregated size, but only the biggest
+/// files. Storing each file path used to cost tens of GiB on large trees.
+struct Store {
+    dirs: DashMap<PathBuf, Entry>,
+    files: TopFiles,
+}
+
+impl Store {
+    fn new(count: usize) -> Self {
+        Self {
+            dirs: DashMap::new(),
+            files: TopFiles::new(count),
+        }
+    }
+
+    /// Add `size`/`files` to `start` and each of its ancestors up to `root`.
+    fn add_to_ancestors(&self, start: Option<&Path>, root: &Path, size: u64, files: u64) {
+        let mut cur = start;
+        while let Some(p) = cur {
+            if !p.starts_with(root) {
+                break;
+            }
+            match self.dirs.get_mut(p) {
+                Some(mut e) => {
+                    e.size += size;
+                    e.file_count += files;
+                    e.is_dir = true;
+                }
+                None => {
+                    let mut e = self.dirs.entry(p.to_path_buf()).or_default();
+                    e.size += size;
+                    e.file_count += files;
+                    e.is_dir = true;
+                }
+            }
+            if p == root {
+                break;
+            }
+            cur = p.parent();
+        }
+    }
+
+    fn root_size(&self, root: &Path) -> u64 {
+        self.dirs.get(root).map(|r| r.size).unwrap_or(0)
+    }
+
+    /// The `count` biggest entries (directories and files), excluding the root.
+    fn top(&self, root: &Path, count: usize) -> Vec<(PathBuf, Entry)> {
+        let mut top = TopN::new(count);
+        for r in self.dirs.iter() {
+            if r.key().as_path() == root {
+                continue;
+            }
+            top.offer(r.value().size, || (r.key().clone(), r.value().clone()));
+        }
+        for (path, entry) in self.files.snapshot() {
+            top.offer(entry.size, || (path, entry));
+        }
+        top.into_sorted()
+    }
+}
+
+type SharedStore = Arc<Store>;
 
 #[derive(Default, Debug)]
 struct TreeNode {
@@ -268,13 +415,13 @@ fn render_node(
 
 fn walker_local(
     root: PathBuf,
-    entries: SharedEntryMap,
+    store: SharedStore,
     running: Arc<AtomicBool>,
     scanned: Arc<AtomicU64>,
     apparent: bool,
     range: TimeRange,
 ) {
-    let entries_cb = Arc::clone(&entries);
+    let store_cb = Arc::clone(&store);
     let scanned_cb = Arc::clone(&scanned);
     let running_cb = Arc::clone(&running);
     let root_cb = root.clone();
@@ -283,19 +430,23 @@ fn walker_local(
         .skip_hidden(false)
         .follow_links(false)
         .parallelism(jwalk::Parallelism::RayonNewPool(num_cpus()))
-        .process_read_dir(move |_depth, _dir_path, _state, children| {
+        .process_read_dir(move |_depth, dir_path, _state, children| {
             if !running_cb.load(Ordering::Relaxed) {
                 children.clear();
                 return;
             }
+            let mut dir_size: u64 = 0;
+            let mut dir_files: u64 = 0;
+            let mut seen: u64 = 0;
             for child_result in children.iter() {
                 let Ok(child) = child_result else { continue };
+                if child.file_type().is_dir() {
+                    seen += 1;
+                    continue;
+                }
                 let Ok(meta) = child.metadata() else { continue };
 
-                let path = child.path();
-                let is_dir = meta.is_dir();
-
-                if !is_dir && range.is_active() {
+                if range.is_active() {
                     match mtime_secs(&meta) {
                         Some(secs) if range.contains(secs) => {}
                         _ => continue,
@@ -320,35 +471,32 @@ fn walker_local(
                     0
                 };
 
-                scanned_cb.fetch_add(1, Ordering::Relaxed);
-
-                {
-                    let mut e = entries_cb.entry(path.clone()).or_default();
-                    e.is_dir = is_dir;
-                    if !is_dir {
-                        e.size = size;
-                    }
-                }
-
-                if !is_dir {
-                    let mut cur = path.parent();
-                    while let Some(p) = cur {
-                        if p != root_cb.as_path() && !p.starts_with(&root_cb) {
-                            break;
-                        }
-                        {
-                            let mut e = entries_cb.entry(p.to_path_buf()).or_default();
-                            e.size += size;
-                            e.file_count += 1;
-                            e.is_dir = true;
-                        }
-                        if p == root_cb.as_path() {
-                            break;
-                        }
-                        cur = p.parent();
-                    }
-                }
+                seen += 1;
+                dir_size += size;
+                dir_files += 1;
+                store_cb.files.offer(size, || {
+                    (
+                        child.path(),
+                        Entry {
+                            size,
+                            ..Entry::default()
+                        },
+                    )
+                });
             }
+            scanned_cb.fetch_add(seen, Ordering::Relaxed);
+
+            {
+                let mut e = store_cb.dirs.entry(dir_path.to_path_buf()).or_default();
+                e.is_dir = true;
+                e.size += dir_size;
+                e.file_count += dir_files;
+            }
+            if dir_files > 0 && dir_path != root_cb.as_path() {
+                store_cb.add_to_ancestors(dir_path.parent(), &root_cb, dir_size, dir_files);
+            }
+
+            children.retain(|c| matches!(c, Ok(c) if c.file_type().is_dir()));
         });
 
     for entry in walker {
@@ -362,7 +510,7 @@ fn walker_local(
 
 fn walker_hdfs_cli(
     url: &str,
-    entries: SharedEntryMap,
+    store: SharedStore,
     running: Arc<AtomicBool>,
     scanned: Arc<AtomicU64>,
     range: TimeRange,
@@ -426,32 +574,22 @@ fn walker_hdfs_cli(
         
         scanned.fetch_add(1, Ordering::Relaxed);
 
-        // Update entry
-        {
-            let mut e = entries.entry(entry_path.clone()).or_default();
-            e.is_dir = is_dir;
-            if !is_dir {
-                e.size = size;
-            }
+        if is_dir {
+            let mut e = store.dirs.entry(entry_path).or_default();
+            e.is_dir = true;
             e.mtime = Some(mtime_str);
-        }
-
-        // Accumulate size and file count to parents
-        if !is_dir {
-            let mut cur = entry_path.parent();
-            while let Some(p) = cur {
-                if p != root.as_path() && !p.starts_with(&root) {
-                    break;
-                }
-                let mut e = entries.entry(p.to_path_buf()).or_default();
-                e.size += size;
-                e.file_count += 1;
-                e.is_dir = true;
-                if p == root.as_path() {
-                    break;
-                }
-                cur = p.parent();
-            }
+        } else {
+            store.add_to_ancestors(entry_path.parent(), &root, size, 1);
+            store.files.offer(size, || {
+                (
+                    entry_path,
+                    Entry {
+                        size,
+                        mtime: Some(mtime_str),
+                        ..Entry::default()
+                    },
+                )
+            });
         }
     }
 
@@ -481,87 +619,15 @@ fn walker_hdfs_cli(
     Ok(())
 }
 
-fn prune_to_top_n(entries: &SharedEntryMap, root: &Path, count: usize) {
-    let mut snapshot: Vec<(PathBuf, u64)> = entries
-        .iter()
-        .filter(|r| r.key().as_path() != root)
-        .map(|r| (r.key().clone(), r.value().size))
-        .collect();
-
-    let take = (count * 2).min(snapshot.len());
-    if snapshot.len() > take {
-        snapshot.select_nth_unstable_by(take, |a, b| b.1.cmp(&a.1));
-        snapshot.truncate(take);
+/// After scan completes, stamp the final top-N with their mtime.
+/// Remote listings already carry it; local entries are stat'ed here.
+fn enrich_top_entries(top: &mut [(PathBuf, Entry)], is_remote: bool) {
+    if is_remote {
+        return;
     }
-
-    let mut to_keep: std::collections::HashSet<PathBuf> =
-        std::collections::HashSet::with_capacity(take * 6);
-    to_keep.insert(root.to_path_buf());
-
-    for (path, _) in &snapshot {
-        to_keep.insert(path.clone());
-        let mut cur = path.parent();
-        while let Some(p) = cur {
-            if !p.starts_with(root) && p != root {
-                break;
-            }
-            to_keep.insert(p.to_path_buf());
-            if p == root {
-                break;
-            }
-            cur = p.parent();
-        }
-    }
-
-    entries.retain(|k, _| to_keep.contains(k));
-}
-
-
-/// After scan completes, enrich the top-N entries with their mtime.
-/// For local paths: stat each directory to get mtime, count immediate children.
-/// For remote paths: child_count is computed from the entries map, mtime already stored.
-fn enrich_top_entries(entries: &SharedEntryMap, root: &Path, count: usize, is_remote: bool) {
-    // Get top-N entries
-    let mut snapshot: Vec<(PathBuf, u64, bool)> = entries
-        .iter()
-        .filter(|r| r.key().as_path() != root)
-        .map(|r| (r.key().clone(), r.value().size, r.value().is_dir))
-        .collect();
-
-    snapshot.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-    snapshot.truncate(count);
-
-    for (path, _, _is_dir) in &snapshot {
-        // For local paths, get mtime from filesystem
-        if !is_remote {
-            if let Ok(meta) = std::fs::metadata(path) {
-                if let Ok(modified) = meta.modified() {
-                    let duration = modified
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default();
-                    let secs = duration.as_secs() as i64;
-                    let mtime_str = format_timestamp(secs);
-                    if let Some(mut e) = entries.get_mut(path) {
-                        e.mtime = Some(mtime_str);
-                    }
-                }
-            }
-        }
-    }
-
-    // Also enrich root
-    if !is_remote {
-        if let Ok(meta) = std::fs::metadata(root) {
-            if let Ok(modified) = meta.modified() {
-                let duration = modified
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default();
-                let secs = duration.as_secs() as i64;
-                let mtime_str = format_timestamp(secs);
-                if let Some(mut e) = entries.get_mut(&root.to_path_buf()) {
-                    e.mtime = Some(mtime_str);
-                }
-            }
+    for (path, e) in top.iter_mut() {
+        if let Some(secs) = std::fs::metadata(path).ok().as_ref().and_then(mtime_secs) {
+            e.mtime = Some(format_timestamp(secs));
         }
     }
 }
@@ -745,32 +811,9 @@ impl Drop for CursorGuard {
     }
 }
 
-fn render_screen(
-    entries: &SharedEntryMap,
-    root: &Path,
-    count: usize,
-    scanned: u64,
-    last_height: &mut u16,
-    finished: bool,
-    filter_label: Option<&str>,
-) {
-    let mut snapshot: Vec<(PathBuf, Entry)> = entries
-        .iter()
-        .filter(|r| r.key().as_path() != root)
-        .map(|r| (r.key().clone(), r.value().clone()))
-        .collect();
-    if snapshot.len() > count {
-        snapshot.select_nth_unstable_by(count, |a, b| b.1.size.cmp(&a.1.size));
-        snapshot.truncate(count);
-    }
-    snapshot.sort_unstable_by(|a, b| b.1.size.cmp(&a.1.size));
-    let root_size = entries
-        .get(&root.to_path_buf())
-        .map(|r| r.size)
-        .unwrap_or(0);
-
+fn build_tree(top: &[(PathBuf, Entry)], root: &Path) -> TreeNode {
     let mut tree = TreeNode::default();
-    for (path, info) in &snapshot {
+    for (path, info) in top {
         let rel = path.strip_prefix(root).unwrap_or(path);
         let comps: Vec<OsString> = rel
             .components()
@@ -781,6 +824,19 @@ fn render_screen(
         }
     }
     compute_sort_keys(&mut tree);
+    tree
+}
+
+fn render_screen(
+    top: &[(PathBuf, Entry)],
+    root: &Path,
+    root_size: u64,
+    scanned: u64,
+    last_height: &mut u16,
+    finished: bool,
+    filter_label: Option<&str>,
+) {
+    let tree = build_tree(top, root);
 
     let status = if finished { "done " } else { "scan " };
     let mut status_line = format!(
@@ -814,9 +870,32 @@ fn render_screen(
         render_node(child, &cname.to_string_lossy(), "", last, &mut lines);
     }
 
-    lines.push(status_line);
+    let (term_width, term_height) = crossterm::terminal::size()
+        .map(|(w, h)| (w as usize, h as usize))
+        .unwrap_or((200, usize::MAX));
 
-    let term_width = crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(200);
+    // While scanning, the live view must fit on screen: the cursor cannot move
+    // above the top row, so a taller redraw would pile up instead of replacing
+    // the previous frame. The final frame is printed in full.
+    if !finished {
+        let max = term_height.saturating_sub(1).max(3);
+        if lines.len() + 1 > max {
+            let keep = max - 2;
+            let hidden = lines.len() - keep;
+            lines.truncate(keep);
+            lines.push(format!(
+                "{:>10}  {}",
+                "",
+                ansi(
+                    &format!("… {} more lines, full tree at the end of the scan", hidden),
+                    Color::DarkGrey,
+                    false
+                )
+            ));
+        }
+    }
+
+    lines.push(status_line);
 
     let mut out = stdout();
     if *last_height > 0 {
@@ -834,7 +913,7 @@ fn render_screen(
     }
 
     let _ = out.flush();
-    *last_height = lines.len() as u16;
+    *last_height = lines.len().min(u16::MAX as usize) as u16;
 }
 
 /// Truncate a string containing ANSI escape codes to `max_visible` visible characters.
@@ -925,37 +1004,14 @@ fn render_node_plain(
 }
 
 fn render_slack_text(
-    entries: &SharedEntryMap,
+    top: &[(PathBuf, Entry)],
     root: &Path,
-    count: usize,
+    root_size: u64,
     scanned: u64,
     filter_label: Option<&str>,
 ) -> String {
-    let mut snapshot: Vec<(PathBuf, Entry)> = entries
-        .iter()
-        .filter(|r| r.key().as_path() != root)
-        .map(|r| (r.key().clone(), r.value().clone()))
-        .collect();
-    snapshot.sort_unstable_by(|a, b| b.1.size.cmp(&a.1.size));
-    snapshot.truncate(count);
+    let tree = build_tree(top, root);
 
-    let root_size = entries
-        .get(&root.to_path_buf())
-        .map(|r| r.size)
-        .unwrap_or(0);
-
-    let mut tree = TreeNode::default();
-    for (path, info) in &snapshot {
-        let rel = path.strip_prefix(root).unwrap_or(path);
-        let comps: Vec<OsString> = rel
-            .components()
-            .map(|c| c.as_os_str().to_os_string())
-            .collect();
-        if !comps.is_empty() {
-            insert_path(&mut tree, &comps, info);
-        }
-    }
-    compute_sort_keys(&mut tree);
 
     let mut lines = Vec::new();
     lines.push(format!("📂 {}", root.display()));
@@ -1087,7 +1143,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let filter_label = range.label();
 
-    let entries: SharedEntryMap = Arc::new(DashMap::new());
+    let store: SharedStore = Arc::new(Store::new(cli.count));
     let running = Arc::new(AtomicBool::new(true));
     let scanned = Arc::new(AtomicU64::new(0));
     let walker_done = Arc::new(AtomicBool::new(false));
@@ -1111,7 +1167,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let walker_handle = {
-        let entries = Arc::clone(&entries);
+        let store = Arc::clone(&store);
         let running = Arc::clone(&running);
         let scanned = Arc::clone(&scanned);
         let done = Arc::clone(&walker_done);
@@ -1122,9 +1178,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         thread::spawn(move || {
             let result = if is_remote_path(&path) {
-                walker_hdfs_cli(&path, entries, running, scanned, range)
+                walker_hdfs_cli(&path, store, running, scanned, range)
             } else {
-                walker_local(root_clone, entries, running, scanned, apparent, range);
+                walker_local(root_clone, store, running, scanned, apparent, range);
                 Ok(())
             };
             if let Err(e) = result {
@@ -1140,22 +1196,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _guard = CursorGuard::new();
         let mut last_scanned: u64 = 0;
         loop {
+            if walker_done.load(Ordering::Relaxed) {
+                break;
+            }
             let cur_scanned = scanned.load(Ordering::Relaxed);
-            let done = walker_done.load(Ordering::Relaxed);
-            if cur_scanned != last_scanned || done {
+            if cur_scanned != last_scanned {
                 render_screen(
-                    &entries,
+                    &store.top(&root, cli.count),
                     &root,
-                    cli.count,
+                    store.root_size(&root),
                     cur_scanned,
                     &mut last_height,
-                    done,
+                    false,
                     filter_label.as_deref(),
                 );
                 last_scanned = cur_scanned;
-            }
-            if done {
-                break;
             }
             thread::sleep(Duration::from_millis(cli.refresh_ms));
         }
@@ -1170,14 +1225,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let walker_err = walker_error.lock().unwrap().take();
 
-    prune_to_top_n(&entries, &root, cli.count);
-    enrich_top_entries(&entries, &root, cli.count, is_remote);
+    let mut top = store.top(&root, cli.count);
+    enrich_top_entries(&mut top, is_remote);
+    let root_size = store.root_size(&root);
 
     if interactive || !slack_mode {
         render_screen(
-            &entries,
+            &top,
             &root,
-            cli.count,
+            root_size,
             scanned.load(Ordering::Relaxed),
             &mut last_height,
             true,
@@ -1188,9 +1244,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if slack_mode {
         let tree_text = render_slack_text(
-            &entries,
+            &top,
             &root,
-            cli.count,
+            root_size,
             scanned.load(Ordering::Relaxed),
             filter_label.as_deref(),
         );

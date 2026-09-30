@@ -145,8 +145,9 @@ En mode Slack, l'affichage temps réel est désactivé ; le scan s'exécute puis
 
 ## Fonctionnement
 
-- Scan local parallèle via `jwalk` (un pool Rayon par cœur CPU), tailles accumulées dans une `DashMap` concurrente.
-- Après le scan, l'arbre est élagué au top-N (plus les ancêtres nécessaires à l'affichage) puis enrichi avec le nombre d'enfants et la date de modification.
+- Scan local parallèle via `jwalk` (un pool Rayon par cœur CPU). Seuls les répertoires sont conservés en mémoire (taille et nombre de fichiers agrégés dans une `DashMap` concurrente) ; pour les fichiers, seul le top-N est gardé. La mémoire dépend donc du nombre de répertoires, pas du nombre de fichiers.
+- Après le scan, le top-N final est enrichi avec la date de modification.
+- Pendant le scan, l'affichage temps réel est limité à la hauteur du terminal ; l'arbre complet est affiché à la fin.
 - L'affichage compacte les chaînes de répertoires à enfant unique (`a/b/c`) et tronque proprement les lignes trop longues pour le terminal.
 
 ## Licence
