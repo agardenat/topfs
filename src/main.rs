@@ -53,6 +53,12 @@ struct Cli {
     #[arg(short = 'U', long = "until", visible_alias = "older-than", value_name = "WHEN")]
     until: Option<String>,
 
+    /// Only detail the first N levels below PATH. Deeper content is still scanned
+    /// and its size is rolled up into its level-N ancestor
+    #[arg(short = 'L', long = "max-depth", value_name = "N",
+          value_parser = clap::value_parser!(u32).range(1..))]
+    max_depth: Option<u32>,
+
     /// Send results to a Slack webhook URL (disables real-time display).
     /// If URL is empty, outputs Slack-compatible format to stdout.
     #[arg(long = "slack", num_args = 0..=1, default_missing_value = "")]
@@ -232,6 +238,22 @@ impl Store {
 }
 
 type SharedStore = Arc<Store>;
+
+/// Number of levels `path` lies below `root` (the root itself is 0).
+fn depth_below(path: &Path, root: &Path) -> usize {
+    path.strip_prefix(root).map_or(0, |r| r.components().count())
+}
+
+/// The ancestor of `path` (possibly itself) lying at most `max` levels below `root`.
+fn clamp_depth<'a>(path: &'a Path, root: &Path, max: Option<usize>) -> &'a Path {
+    match max {
+        Some(max) => path
+            .ancestors()
+            .nth(depth_below(path, root).saturating_sub(max))
+            .unwrap_or(path),
+        None => path,
+    }
+}
 
 #[derive(Default, Debug)]
 struct TreeNode {
@@ -420,6 +442,7 @@ fn walker_local(
     scanned: Arc<AtomicU64>,
     apparent: bool,
     range: TimeRange,
+    max_depth: Option<usize>,
 ) {
     let store_cb = Arc::clone(&store);
     let scanned_cb = Arc::clone(&scanned);
@@ -435,6 +458,12 @@ fn walker_local(
                 children.clear();
                 return;
             }
+            // jwalk also reads the root's parent to yield the root entry itself.
+            if !dir_path.starts_with(&root_cb) {
+                return;
+            }
+            let child_depth = depth_below(dir_path, &root_cb) + 1;
+            let files_in_top = max_depth.map_or(true, |m| child_depth <= m);
             let mut dir_size: u64 = 0;
             let mut dir_files: u64 = 0;
             let mut seen: u64 = 0;
@@ -474,6 +503,9 @@ fn walker_local(
                 seen += 1;
                 dir_size += size;
                 dir_files += 1;
+                if !files_in_top {
+                    continue;
+                }
                 store_cb.files.offer(size, || {
                     (
                         child.path(),
@@ -486,14 +518,15 @@ fn walker_local(
             }
             scanned_cb.fetch_add(seen, Ordering::Relaxed);
 
+            let anchor = clamp_depth(dir_path, &root_cb, max_depth);
             {
-                let mut e = store_cb.dirs.entry(dir_path.to_path_buf()).or_default();
+                let mut e = store_cb.dirs.entry(anchor.to_path_buf()).or_default();
                 e.is_dir = true;
                 e.size += dir_size;
                 e.file_count += dir_files;
             }
-            if dir_files > 0 && dir_path != root_cb.as_path() {
-                store_cb.add_to_ancestors(dir_path.parent(), &root_cb, dir_size, dir_files);
+            if dir_files > 0 && anchor != root_cb.as_path() {
+                store_cb.add_to_ancestors(anchor.parent(), &root_cb, dir_size, dir_files);
             }
 
             children.retain(|c| matches!(c, Ok(c) if c.file_type().is_dir()));
@@ -514,6 +547,7 @@ fn walker_hdfs_cli(
     running: Arc<AtomicBool>,
     scanned: Arc<AtomicU64>,
     range: TimeRange,
+    max_depth: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use std::io::BufRead;
     use std::process::{Command, Stdio};
@@ -574,12 +608,19 @@ fn walker_hdfs_cli(
         
         scanned.fetch_add(1, Ordering::Relaxed);
 
+        let in_depth = max_depth.map_or(true, |m| depth_below(&entry_path, &root) <= m);
         if is_dir {
-            let mut e = store.dirs.entry(entry_path).or_default();
-            e.is_dir = true;
-            e.mtime = Some(mtime_str);
+            if in_depth {
+                let mut e = store.dirs.entry(entry_path).or_default();
+                e.is_dir = true;
+                e.mtime = Some(mtime_str);
+            }
         } else {
-            store.add_to_ancestors(entry_path.parent(), &root, size, 1);
+            let parent = entry_path.parent().map(|p| clamp_depth(p, &root, max_depth));
+            store.add_to_ancestors(parent, &root, size, 1);
+            if !in_depth {
+                continue;
+            }
             store.files.offer(size, || {
                 (
                     entry_path,
@@ -1016,7 +1057,7 @@ fn render_slack_text(
     let mut lines = Vec::new();
     lines.push(format!("📂 {}", root.display()));
     if let Some(f) = filter_label {
-        lines.push(format!("🕒 {}", f));
+        lines.push(format!("🔎 {}", f));
     }
 
     let mut top_entries: Vec<_> = tree.children.iter().collect();
@@ -1141,7 +1182,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .into());
         }
     }
-    let filter_label = range.label();
+    let max_depth = cli.max_depth.map(|d| d as usize);
+    let filter_label = {
+        let parts: Vec<String> = range
+            .label()
+            .into_iter()
+            .chain(max_depth.map(|d| format!("depth <= {}", d)))
+            .collect();
+        (!parts.is_empty()).then(|| parts.join(", "))
+    };
 
     let store: SharedStore = Arc::new(Store::new(cli.count));
     let running = Arc::new(AtomicBool::new(true));
@@ -1178,9 +1227,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         thread::spawn(move || {
             let result = if is_remote_path(&path) {
-                walker_hdfs_cli(&path, store, running, scanned, range)
+                walker_hdfs_cli(&path, store, running, scanned, range, max_depth)
             } else {
-                walker_local(root_clone, store, running, scanned, apparent, range);
+                walker_local(root_clone, store, running, scanned, apparent, range, max_depth);
                 Ok(())
             };
             if let Err(e) = result {

@@ -73,6 +73,7 @@ topfs --since 2026-01-01 /data # fichiers modifiés depuis le 1er janvier 2026
 topfs --until 2025-01-01 /data # fichiers plus vieux que le 1er janvier 2025
 topfs --since 2025-01-01 --until 2025-07-01 /data   # fenêtre entre deux dates
 topfs --older-than 90d /data   # fichiers dont la dernière modification remonte à plus de 90 jours
+topfs -L 2 /data               # détail limité à 2 niveaux, tailles réelles cumulées
 topfs hdfs:///user/data        # scan HDFS via le client hdfs
 topfs abfs://container@account/path   # scan Azure Blob Storage
 ```
@@ -90,6 +91,7 @@ Le scan est incrémental et l'affichage se rafraîchit en continu. `Ctrl-C` inte
 | `--days` | `-d` | | Ne compte que les fichiers modifiés dans les N derniers jours ; les plus anciens sont exclus de l'accumulation. Incompatible avec `--since`. |
 | `--since` | `-S`, `--newer-than` | | Ne compte que les fichiers modifiés **à partir de** cet instant (borne incluse). |
 | `--until` | `-U`, `--older-than` | | Ne compte que les fichiers modifiés **strictement avant** cet instant. |
+| `--max-depth` | `-L` | | Limite le détail aux N premiers niveaux sous `PATH` (N ≥ 1). Le scan reste complet : le contenu plus profond est cumulé dans son ancêtre de niveau N. |
 | `--slack` | | | Envoie le résultat à une URL de webhook Slack (désactive l'affichage temps réel). Sans valeur, écrit un format compatible Slack sur stdout. |
 | `--message` | `-m` | | Message d'en-tête à inclure dans la sortie Slack. |
 | `--help` | `-h` | | Affiche l'aide. |
@@ -114,6 +116,19 @@ topfs --newer-than 2w --older-than 2d /var/log
 Une fenêtre vide (`since >= until`) est rejetée. Le filtre actif est rappelé dans la ligne de statut et dans la sortie Slack.
 
 Seuls les fichiers sont filtrés : les répertoires restent affichés, avec la taille **et le nombre de fichiers** cumulés sur les seuls fichiers retenus. Un répertoire de 10 000 fichiers dont 3 sont récents affiche donc `(3 files, ...)` sous `--since`.
+
+### Profondeur limitée
+
+`--max-depth N` (`-L N`) sert à repérer rapidement les branches les plus lourdes d'une grosse arborescence avant de creuser :
+
+```bash
+topfs -L 1 -n 50 /data     # poids réel de chaque entrée directe de /data
+topfs -L 2 /data/projets   # puis on descend d'un cran dans la branche suspecte
+```
+
+Seuls les répertoires et fichiers situés à N niveaux ou moins de `PATH` sont candidats au top-N. Tout le reste est parcouru et compté, mais cumulé dans son ancêtre de niveau N : les tailles et les nombres de fichiers affichés sont donc les vrais totaux récursifs. La durée du scan ne change pas, puisque chaque fichier doit être lu pour obtenir son poids. En revanche, la mémoire ne dépend plus que du nombre de répertoires de profondeur ≤ N.
+
+L'option se combine avec `--since` / `--until` / `--days`. Elle est rappelée dans la ligne de statut et dans la sortie Slack.
 
 ### Usage disque vs taille apparente
 
@@ -146,6 +161,7 @@ En mode Slack, l'affichage temps réel est désactivé ; le scan s'exécute puis
 ## Fonctionnement
 
 - Scan local parallèle via `jwalk` (un pool Rayon par cœur CPU). Seuls les répertoires sont conservés en mémoire (taille et nombre de fichiers agrégés dans une `DashMap` concurrente) ; pour les fichiers, seul le top-N est gardé. La mémoire dépend donc du nombre de répertoires, pas du nombre de fichiers.
+- Avec `--max-depth N`, seuls les répertoires de profondeur ≤ N sont stockés ; ceux plus profonds alimentent directement leur ancêtre de niveau N.
 - Après le scan, le top-N final est enrichi avec la date de modification.
 - Pendant le scan, l'affichage temps réel est limité à la hauteur du terminal ; l'arbre complet est affiché à la fin.
 - L'affichage compacte les chaînes de répertoires à enfant unique (`a/b/c`) et tronque proprement les lignes trop longues pour le terminal.
